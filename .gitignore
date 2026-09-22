@@ -1,0 +1,4 @@
+# 测试/演示产物
+*.log
+*.out
+coverage.txt
