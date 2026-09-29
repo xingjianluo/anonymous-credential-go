@@ -134,18 +134,22 @@ func TestIncompatibleParameters(t *testing.T) {
 	id := f.issue(t, goodAttrs())
 
 	// 用“版本号同为 1、但模式定义漂移”的档案覆盖信任登记。
+	// 新规则下普通 Register 拒绝冲突覆盖，必须由管理员显式 Replace，
+	// 以便精确模拟“信任档案已被漂移参数替换”这一攻击/事故场景。
 	drift := v2Policy(f.start)
 	drift.Version = 1
 	// 保留原签发方公钥，使失败精确归因于参数不兼容而非签名伪造。
 	origPub := f.svc.Issuer.ActivePublic()
-	f.svc.Trust.Register(TrustProfile{
+	if err := f.svc.Trust.Replace(TrustProfile{
 		IssuerName: "driving-entitlement",
 		Public: IssuerPublic{
 			Policy:       drift,
 			VerifyingKey: origPub.VerifyingKey,
 			SchemaHash:   drift.SchemaHash(),
 		},
-	})
+	}); err != nil {
+		t.Fatalf("replace trust profile: %v", err)
+	}
 
 	res := f.proveRaw(t, id, VerifyPolicy{
 		AllowPredicates: []string{"is_adult"}, TTL: time.Minute,

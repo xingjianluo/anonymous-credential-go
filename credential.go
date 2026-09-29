@@ -69,11 +69,17 @@ type IssuanceRecord struct {
 	PolicyName    string
 	PolicyVersion int
 	Commitments   map[string][]byte // 仅保留承诺（盐为一次性随机，不可逆）
-	IssuedAt      time.Time
-	ExpiresAt     time.Time
-	Revoked       bool
-	RevokedAt     time.Time
-	RevokeReason  string
+	// HolderVerifyKey 为签入凭证的持有者一次性出示公钥；
+	// 用于在 v2 出示申请时鉴权“凭证持有者本人”，验证方永远看不到它。
+	HolderVerifyKey []byte
+	// Predicates 为签发时满足并预签发过令牌的谓词名集合（不含属性值）。
+	Predicates   []string
+	IssuedAt     time.Time
+	NotBefore    time.Time
+	ExpiresAt    time.Time
+	Revoked      bool
+	RevokedAt    time.Time
+	RevokeReason string
 }
 
 // encodeValue 返回属性值的规范编码。

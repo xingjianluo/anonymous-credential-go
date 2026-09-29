@@ -33,6 +33,12 @@ type Presentation struct {
 	SessionNonce []byte `json:"session_nonce"`
 	HolderProof  []byte `json:"holder_proof"`
 
+	// v2（不可关联出示）字段：Envelope 非空表示这是一次每次出示独立的 v2 证明。
+	// v2 证明中上述 Signed 字段必须为空（不携带长期 CredID/化名/固定承诺）。
+	Envelope   *ShowEnvelope        `json:"envelope,omitempty"`
+	ShowTokens []PresentedShowToken `json:"show_tokens,omitempty"`
+	Assertion  *RevocationAssertion `json:"assertion,omitempty"`
+
 	// 证明生成时间（持有者时钟，用于日志/调试；信任以签名与会话为准）
 	GeneratedAt time.Time `json:"generated_at"`
 }
@@ -77,10 +83,13 @@ func (p *Presentation) disclosedNames() []string {
 	return names
 }
 
-// predicateNames 返回被出示谓词名集合（排序后）。
+// predicateNames 返回被出示谓词名集合（排序后）；兼容 v1 令牌与 v2 当次令牌。
 func (p *Presentation) predicateNames() []string {
-	names := make([]string, 0, len(p.Predicates))
+	names := make([]string, 0, len(p.Predicates)+len(p.ShowTokens))
 	for _, pr := range p.Predicates {
+		names = append(names, pr.Token.Name)
+	}
+	for _, pr := range p.ShowTokens {
 		names = append(names, pr.Token.Name)
 	}
 	sort.Strings(names)

@@ -24,37 +24,47 @@ func NewAuditLogger(w io.Writer) *AuditLogger {
 }
 
 // LogDecision 记录一次验证结论。
+//
+// v2（不可关联）决策只记录 mode 与当次 show_id，绝不记录长期 CredID；
+// legacy 决策保留 cred_id（旧版出示方式的已知可关联限制）。
 func (a *AuditLogger) LogDecision(d *Decision) {
 	if a == nil || d == nil {
 		return
 	}
-	if d.Accepted {
-		a.l.Info("verify_decision",
+	mode := d.Mode
+	if mode == "" {
+		mode = "legacy"
+	}
+	common := func(accepted bool, level slog.Level) {
+		attrs := []slog.Attr{
 			slog.String("event", "verify"),
-			slog.Bool("accepted", true),
+			slog.String("mode", mode),
+			slog.Bool("accepted", accepted),
 			slog.String("session_id", d.SessionID),
 			slog.String("issuer", d.Issuer),
 			slog.Int("policy_version", d.PolicyVersion),
-			slog.String("cred_id", d.CredID),
 			slog.Any("disclosed_attrs", d.DisclosedAttrs),
 			slog.Any("predicates", d.Predicates),
-			slog.String("basis", "signature_ok|commitments_ok|session_bound|not_revoked"),
 			slog.Time("checked_at", d.CheckedAt),
-		)
-		return
+		}
+		if mode == "v2" {
+			// show_id 每次出示独立随机，无法跨出示串联。
+			attrs = append(attrs, slog.String("show_id", d.ShowID))
+		} else {
+			attrs = append(attrs, slog.String("cred_id", d.CredID))
+		}
+		if accepted {
+			attrs = append(attrs, slog.String("basis", "signature_ok|commitments_ok|session_bound|not_revoked"))
+		} else {
+			attrs = append(attrs, slog.String("basis", string(d.Reason)))
+		}
+		a.l.LogAttrs(context.Background(), level, "verify_decision", attrs...)
 	}
-	a.l.Warn("verify_decision",
-		slog.String("event", "verify"),
-		slog.Bool("accepted", false),
-		slog.String("session_id", d.SessionID),
-		slog.String("issuer", d.Issuer),
-		slog.Int("policy_version", d.PolicyVersion),
-		slog.String("cred_id", d.CredID),
-		slog.Any("disclosed_attrs", d.DisclosedAttrs),
-		slog.Any("predicates", d.Predicates),
-		slog.String("basis", string(d.Reason)),
-		slog.Time("checked_at", d.CheckedAt),
-	)
+	level := slog.LevelWarn
+	if d.Accepted {
+		level = slog.LevelInfo
+	}
+	common(d.Accepted, level)
 }
 
 // LogIssuance 记录一次签发动作（仅记录凭证标识与策略版本，无属性值）。

@@ -1,6 +1,7 @@
 package anoncred
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
 	"sort"
@@ -194,4 +195,145 @@ func (h *Holder) lookup(credIDHex string) *StoredCredential {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.stored[credIDHex]
+}
+
+// ShowPrep 是持有者为一次 v2 出示准备的私有上下文。
+//
+// 它暂存当次一次性出示密钥对（ShowSignK）与每个披露属性的原盐/新盐/值；
+// Request 可直接交给签发方 PrepareShow。ShowSignK 只留在持有者手中。
+type ShowPrep struct {
+	Request   ShowRequest
+	ShowSignK ed25519.PrivateKey
+	// 组装最终证明用：披露项（值+新盐），顺序按名称固定。
+	disclosed []PresentedAttribute
+}
+
+// PrepareUnlinkableShow 为指定凭证的一次会话生成 v2 出示申请。
+//
+// 与 BuildPresentation 不同，这里不使用签入凭证的长期出示公钥，而是为
+// “这一次出示”重新生成密钥；所有披露属性也各自取一把全新随机盐。
+func (h *Holder) PrepareUnlinkableShow(credIDHex string, sessionNonce []byte,
+	discloseAttrs, disclosePreds []string) (*ShowPrep, error) {
+	if len(sessionNonce) == 0 {
+		return nil, Fail(CodeMalformedPresentation, "session nonce is required")
+	}
+	h.mu.Lock()
+	st, ok := h.stored[credIDHex]
+	h.mu.Unlock()
+	if !ok {
+		return nil, FailDetail(CodeNoSuchCredential, "holder has no such credential", credIDHex)
+	}
+
+	showPub, showPriv, err := ed25519.GenerateKey(asReader(h.rng))
+	if err != nil {
+		return nil, err
+	}
+
+	allowAttrs := map[string]bool{}
+	for _, a := range discloseAttrs {
+		allowAttrs[a] = true
+	}
+	attrNames := make([]string, 0, len(allowAttrs))
+	for a := range allowAttrs {
+		attrNames = append(attrNames, a)
+	}
+	sort.Strings(attrNames)
+
+	revealed := make(map[string]RevealedAttr, len(attrNames))
+	disclosed := make([]PresentedAttribute, 0, len(attrNames))
+	for _, name := range attrNames {
+		v, vok := st.Cred.AttrValues[name]
+		oldSalt, sok := st.Cred.Salts[name]
+		if !vok || !sok {
+			return nil, FailDetail(CodeDisclosureNotAllowed,
+				"requested disclosure attribute is not present in credential", name)
+		}
+		newSalt, err := h.rng.RandomBytes(16)
+		if err != nil {
+			return nil, err
+		}
+		revealed[name] = RevealedAttr{
+			Value:   v,
+			OldSalt: append([]byte(nil), oldSalt...),
+			NewSalt: append([]byte(nil), newSalt...),
+		}
+		disclosed = append(disclosed, PresentedAttribute{
+			Name:  name,
+			Value: v,
+			Salt:  append([]byte(nil), newSalt...),
+		})
+	}
+
+	allowPreds := map[string]bool{}
+	predNames := make([]string, 0, len(disclosePreds))
+	for _, p := range disclosePreds {
+		if !allowPreds[p] {
+			allowPreds[p] = true
+			predNames = append(predNames, p)
+		}
+	}
+	sort.Strings(predNames)
+	for _, name := range predNames {
+		if _, ok := st.Cred.Signed.PredTokens[name]; !ok {
+			return nil, FailDetail(CodePredicateNotAllowed,
+				"requested predicate token is not available in credential", name)
+		}
+	}
+
+	credID := append([]byte(nil), st.Cred.Signed.CredID...)
+	req := ShowRequest{
+		CredID:        credID,
+		SessionNonce:  append([]byte(nil), sessionNonce...),
+		ShowVerifyKey: showPub,
+		Revealed:      revealed,
+		DisclosePreds: predNames,
+	}
+	// 用“凭证绑定的一次性出示私钥”给申请签名，签发方据此鉴权。
+	req.ShowAuth = ed25519.Sign(st.HolderSignK, showAuthPayload(&req))
+
+	return &ShowPrep{Request: req, ShowSignK: showPriv, disclosed: disclosed}, nil
+}
+
+// BuildUnlinkablePresentation 用签发方返回的一次性材料组装 v2 对外证明，
+// 并用当次出示私钥签名。返回结构中不含任何长期凭证字段。
+func (h *Holder) BuildUnlinkablePresentation(prep *ShowPrep, pkg *ShowPackage) (*Presentation, error) {
+	if prep == nil || pkg == nil || pkg.Envelope == nil || pkg.Assertion == nil {
+		return nil, Fail(CodeMalformedPresentation, "show preparation or package is incomplete")
+	}
+	env := pkg.Envelope
+	if !bytes.Equal(env.SessionNonce, prep.Request.SessionNonce) ||
+		!publicKeyEqual(prep.ShowSignK.Public().(ed25519.PublicKey), env.ShowVerifyKey) {
+		return nil, Fail(CodeBadShowEnvelope, "show envelope is not bound to this preparation")
+	}
+	if len(env.Commitments) != len(prep.disclosed) {
+		return nil, Fail(CodeBadShowEnvelope, "show envelope commitment set differs from disclosed set")
+	}
+	for _, d := range prep.disclosed {
+		if _, ok := env.Commitments[d.Name]; !ok {
+			return nil, FailDetail(CodeBadShowEnvelope, "show envelope is missing a disclosed commitment", d.Name)
+		}
+	}
+
+	tokens := make([]PresentedShowToken, 0, len(prep.Request.DisclosePreds))
+	for _, name := range prep.Request.DisclosePreds {
+		tok, ok := pkg.Tokens[name]
+		if !ok {
+			return nil, FailDetail(CodeBadShowEnvelope, "show package missing requested predicate token", name)
+		}
+		tokens = append(tokens, PresentedShowToken{Token: tok})
+	}
+
+	pres := &Presentation{
+		Envelope:     env,
+		Disclosed:    prep.disclosed,
+		ShowTokens:   tokens,
+		SessionNonce: append([]byte(nil), prep.Request.SessionNonce...),
+		Assertion:    pkg.Assertion,
+		GeneratedAt:  h.clock.Now(),
+	}
+	// 显式保证：长期凭证公开部分与旧令牌集合绝不进入 v2 证明。
+	pres.Signed = SignedCredential{}
+	pres.Predicates = nil
+	pres.HolderProof = ed25519.Sign(prep.ShowSignK, pres.holderProofPayloadV2())
+	return pres, nil
 }

@@ -33,9 +33,14 @@ const (
 	CodeProofReplay       Code = "proof_replay"       // 同一证明重复使用/重放
 
 	// 版本
-	CodeUnknownVersion         Code = "unknown_version"         // 未知版本，拒绝
-	CodeVersionRejected        Code = "version_rejected"        // 历史版本被显式停用（日落规则）
-	CodeIncompatibleParameters Code = "incompatible_parameters" // 版本参数/模式哈希不兼容
+	CodeUnknownVersion         Code = "unknown_version"              // 未知版本，拒绝
+	CodeVersionRejected        Code = "version_rejected"             // 历史版本被显式停用（日落规则）
+	CodeIncompatibleParameters Code = "incompatible_parameters"      // 版本参数/模式哈希不兼容
+	CodeVersionConflict        Code = "version_conflict"             // 同版本号重复发布但参数不一致
+	CodeLegacyRejected         Code = "legacy_presentation_rejected" // 兼容窗口结束，旧版可关联出示方式被拒绝
+
+	// 不可关联出示（v2）
+	CodeBadShowEnvelope Code = "bad_show_envelope" // 一次性出示封套无效（缺失/混用/绑定错误）
 
 	// 签发方管理
 	CodeNoSuchCredential Code = "no_such_credential" // 吊销/核对时找不到签发记录

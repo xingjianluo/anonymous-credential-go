@@ -58,13 +58,14 @@ func NewService(cfg ServiceConfig) *Service {
 }
 
 // RegisterPolicy 向签发方与验证方信任库同时登记策略版本。
+//
+// 同版本重复登记：参数一致则幂等；参数不一致返回 CodeVersionConflict。
 func (s *Service) RegisterPolicy(p Policy) error {
 	pub, err := s.Issuer.AddPolicyVersion(p)
 	if err != nil {
 		return err
 	}
-	s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub})
-	return nil
+	return s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub})
 }
 
 // IssueAndHold 执行“申请-签发-入钱包”的完整签发流程，返回凭证 ID（hex）。
@@ -111,6 +112,36 @@ func (s *Service) Prove(credIDHex string, pol VerifyPolicy, discloseAttrs, discl
 		DiscloseAttrs: discloseAttrs,
 		DisclosePreds: disclosePreds,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &ProveResult{SessionID: sess.ID, Presentation: pres}, nil
+}
+
+// ProveUnlinkable 为“每次出示不可关联”的 v2 流程创建会话、向签发方申请一次性
+// 封套与撤销断言，并组装对外证明。
+//
+// 流程中 CredID 只出现在持有者->签发方的私有申请里；返回的 Presentation
+// 不含任何跨出示稳定标识。
+func (s *Service) ProveUnlinkable(credIDHex string, pol VerifyPolicy, discloseAttrs, disclosePreds []string) (*ProveResult, error) {
+	st := s.Holder.lookup(credIDHex)
+	if st == nil {
+		return nil, FailDetail(CodeNoSuchCredential, "holder has no such credential", credIDHex)
+	}
+	version := st.Cred.Signed.PolicyVersion
+	sess, err := s.Verifier.NewSession(s.Issuer.name, version, pol)
+	if err != nil {
+		return nil, err
+	}
+	prep, err := s.Holder.PrepareUnlinkableShow(credIDHex, sess.Nonce, discloseAttrs, disclosePreds)
+	if err != nil {
+		return nil, err
+	}
+	pkg, err := s.Issuer.PrepareShow(prep.Request)
+	if err != nil {
+		return nil, err
+	}
+	pres, err := s.Holder.BuildUnlinkablePresentation(prep, pkg)
 	if err != nil {
 		return nil, err
 	}

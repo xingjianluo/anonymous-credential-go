@@ -1,8 +1,10 @@
 package anoncred
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
+	"sort"
 	"sync"
 	"time"
 )
@@ -66,7 +68,28 @@ func (is *Issuer) WithAudit(a *AuditLogger) *Issuer {
 // AddPolicyVersion 登记一个策略版本并为其生成独立签名密钥。
 //
 // 首次登记策略时，签发方对外名称采用策略名（凭证中 PolicyName 与信任标识一致）。
+//
+// 同版本号重复发布规则：
+//   - 参数（策略名、模式指纹、有效期语义）完全一致：幂等返回已登记的公开材料，
+//     不重新生成、不覆盖既有签名密钥，保证同一版本永远只有一套密钥；
+//   - 版本号相同但参数不一致：返回 CodeVersionConflict，绝不静默覆盖。
 func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
+	sum := p.SchemaHash()
+	is.mu.Lock()
+	if is.name == "" {
+		is.name = p.Name
+	}
+	if existing, ok := is.versions[p.Version]; ok {
+		is.mu.Unlock()
+		if existing.Policy.Name == p.Name && bytes.Equal(existing.SchemaHash, sum) {
+			return existing, nil // 幂等重复发布：保持既有密钥与参数
+		}
+		return nil, FailDetail(CodeVersionConflict,
+			"policy version is already registered with different parameters; republishing is rejected",
+			is.name+"#"+itoa(p.Version))
+	}
+	is.mu.Unlock()
+
 	pub, priv, err := ed25519.GenerateKey(asReader(is.rng))
 	if err != nil {
 		return nil, err
@@ -74,11 +97,18 @@ func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 	ip := &IssuerPublic{
 		Policy:       p,
 		VerifyingKey: pub,
-		SchemaHash:   p.SchemaHash(),
+		SchemaHash:   sum,
 	}
 	is.mu.Lock()
-	if is.name == "" {
-		is.name = p.Name
+	// 双检：锁释放期间可能已有同版本登记（并发发布）。
+	if existing, ok := is.versions[p.Version]; ok {
+		is.mu.Unlock()
+		if existing.Policy.Name == p.Name && bytes.Equal(existing.SchemaHash, sum) {
+			return existing, nil
+		}
+		return nil, FailDetail(CodeVersionConflict,
+			"policy version was concurrently registered with different parameters",
+			is.name+"#"+itoa(p.Version))
 	}
 	is.versions[p.Version] = ip
 	is.signKeys[p.Version] = priv
@@ -230,14 +260,22 @@ func (is *Issuer) Issue(req IssueRequest) (*Credential, error) {
 
 	// 留存记录：仅含承诺，不含属性明文；同一持有者的不同凭证 CredID 独立随机。
 	rec := &IssuanceRecord{
-		CredID:        append([]byte(nil), credID...),
-		Pseudonym:     req.Pseudonym,
-		PolicyName:    pol.Name,
-		PolicyVersion: pol.Version,
-		Commitments:   commits, // 与凭证共享同一 map 引用；见落库前复制
-		IssuedAt:      now,
-		ExpiresAt:     signed.ExpiresAt,
+		CredID:          append([]byte(nil), credID...),
+		Pseudonym:       req.Pseudonym,
+		PolicyName:      pol.Name,
+		PolicyVersion:   pol.Version,
+		Commitments:     commits, // 与凭证共享同一 map 引用；见落库前复制
+		HolderVerifyKey: append([]byte(nil), req.HolderVerifyKey...),
+		IssuedAt:        now,
+		NotBefore:       now,
+		ExpiresAt:       signed.ExpiresAt,
 	}
+	predNames := make([]string, 0, len(tokens))
+	for name := range tokens {
+		predNames = append(predNames, name)
+	}
+	sort.Strings(predNames)
+	rec.Predicates = predNames
 	recCommit := make(map[string][]byte, len(commits))
 	for k, v := range commits {
 		recCommit[k] = append([]byte(nil), v...)
@@ -364,4 +402,176 @@ func (is *Issuer) RevocationEpoch() uint64 {
 	is.mu.RLock()
 	defer is.mu.RUnlock()
 	return is.revEpoch
+}
+
+// 每次出示封套/撤销断言的寿命：默认 2 分钟，最长 10 分钟。
+// 它远短于凭证有效期，且只服务于“这一次”出示。
+const (
+	defaultShowTTL = 2 * time.Minute
+	maxShowTTL     = 10 * time.Minute
+)
+
+// PrepareShow 为“单次出示”签发一个短命、与历史不可关联的封套与撤销断言。
+//
+// 安全要点：
+//   - 必须由凭证绑定的一次性出示密钥对请求签名（ShowAuth），凭证已撤销/过期/
+//     未知一律拒绝；
+//   - 对每个要求披露的属性，持有者同时给出原盐与新盐；签发方重算原承诺核对
+//     后，用新盐重新计算承诺并签入封套——明文值只在该私有申请中出现；
+//   - 谓词令牌重新签给当次随机 ShowID，旧令牌绝不复用；
+//   - 返回材料不含 CredID、化名、长期出示公钥等任何跨出示稳定标识。
+func (is *Issuer) PrepareShow(req ShowRequest) (*ShowPackage, error) {
+	if len(req.SessionNonce) == 0 {
+		return nil, Fail(CodeMalformedPresentation, "show request requires a session nonce")
+	}
+	if len(req.ShowVerifyKey) != ed25519.PublicKeySize {
+		return nil, Fail(CodeMalformedPresentation, "show verify key has wrong size")
+	}
+	if len(req.CredID) == 0 {
+		return nil, Fail(CodeNoSuchCredential, "show request lacks credential id")
+	}
+	key := hex.EncodeToString(req.CredID)
+
+	// 在同一把读锁下原子取得记录快照与纪元，避免“已撤销却出具未撤销断言”。
+	is.mu.RLock()
+	rec, ok := is.records[key]
+	if !ok {
+		is.mu.RUnlock()
+		return nil, FailDetail(CodeNoSuchCredential, "no issuance record for credential", key)
+	}
+	recCopy := rec.snapshot()
+	epoch := is.revEpoch
+	pub := is.versions[rec.PolicyVersion]
+	priv := is.signKeys[rec.PolicyVersion]
+	is.mu.RUnlock()
+	if pub == nil {
+		return nil, FailDetail(CodeUnknownVersion, "issuer no longer holds the credential policy version",
+			rec.PolicyName+"#"+itoa(rec.PolicyVersion))
+	}
+
+	if recCopy.Revoked {
+		return nil, Fail(CodeRevokedCredential, "cannot show a revoked credential")
+	}
+	now := is.clock.Now()
+	if now.Before(recCopy.NotBefore) || now.After(recCopy.ExpiresAt) {
+		return nil, Fail(CodeExpiredCredential, "credential is not within its validity window")
+	}
+	// 持有者鉴权：只有持有凭证绑定私钥的一方才能申请出示。
+	if !ed25519.Verify(ed25519.PublicKey(recCopy.HolderVerifyKey), showAuthPayload(&req), req.ShowAuth) {
+		return nil, Fail(CodeBadHolderProof, "show request is not signed by the credential holder key")
+	}
+
+	// 披露属性：重算原承诺核对，再以当次新盐生成全新承诺集合。
+	newCommits := make(map[string][]byte, len(req.Revealed))
+	for name, ra := range req.Revealed {
+		oldWant, exists := recCopy.Commitments[name]
+		if !exists {
+			return nil, FailDetail(CodeDisclosureNotAllowed,
+				"requested disclosure attribute is not part of the credential", name)
+		}
+		if got := commitment(name, ra.OldSalt, ra.Value); !bytes.Equal(got, oldWant) {
+			return nil, FailDetail(CodeTamperedDisclosure,
+				"revealed value or original salt does not match the issued commitment", name)
+		}
+		if len(ra.NewSalt) == 0 {
+			return nil, Fail(CodeMalformedPresentation, "fresh salt is required for a show envelope")
+		}
+		newCommits[name] = commitment(name, ra.NewSalt, ra.Value)
+	}
+
+	// 谓词：必须是签发时确实满足的集合；参数从受信策略现取，避免漂移。
+	satisfied := map[string]bool{}
+	for _, n := range recCopy.Predicates {
+		satisfied[n] = true
+	}
+	predSpecs := map[string]PredicateSpec{}
+	for _, ps := range pub.Policy.Predicates {
+		predSpecs[ps.Name] = ps
+	}
+	predList := append([]string(nil), req.DisclosePreds...)
+	sort.Strings(predList)
+	seenPred := map[string]bool{}
+	for _, name := range predList {
+		if !satisfied[name] {
+			return nil, FailDetail(CodePredicateNotAllowed,
+				"credential does not hold the requested predicate token", name)
+		}
+		if seenPred[name] {
+			return nil, FailDetail(CodeMalformedPresentation, "duplicate predicate in show request", name)
+		}
+		seenPred[name] = true
+		if _, ok := predSpecs[name]; !ok {
+			return nil, FailDetail(CodePredicateNotAllowed, "predicate is not defined by policy", name)
+		}
+	}
+
+	showID, err := is.rng.RandomBytes(16)
+	if err != nil {
+		return nil, err
+	}
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = defaultShowTTL
+	}
+	if ttl > maxShowTTL {
+		ttl = maxShowTTL
+	}
+	expires := now.Add(ttl)
+	// 封套寿命不得超出凭证自身的有效期。
+	if expires.After(recCopy.ExpiresAt) {
+		expires = recCopy.ExpiresAt
+	}
+
+	env := &ShowEnvelope{
+		PolicyName:    pub.Policy.Name,
+		PolicyVersion: pub.Policy.Version,
+		SchemaHash:    append([]byte(nil), pub.SchemaHash...),
+		ShowID:        showID,
+		SessionNonce:  append([]byte(nil), req.SessionNonce...),
+		ShowVerifyKey: append([]byte(nil), req.ShowVerifyKey...),
+		Commitments:   newCommits,
+		NotBefore:     now,
+		ExpiresAt:     expires,
+	}
+	env.Signature = ed25519.Sign(priv, env.signPayload())
+
+	tokens := make(map[string]ShowToken, len(predList))
+	for _, name := range predList {
+		ps := predSpecs[name]
+		tok := ShowToken{
+			Name:      ps.Name,
+			Attr:      ps.Attr,
+			Op:        ps.Op,
+			Threshold: ps.Threshold,
+			StrValue:  ps.StrValue,
+		}
+		tok.Signature = ed25519.Sign(priv,
+			showTokenPayload(showID, tok.Name, tok.Attr, tok.Op, tok.Threshold, tok.StrValue))
+		tokens[name] = tok
+	}
+
+	assertion := &RevocationAssertion{
+		IssuerName:    pub.Policy.Name,
+		PolicyVersion: pub.Policy.Version,
+		SessionNonce:  append([]byte(nil), req.SessionNonce...),
+		Epoch:         epoch,
+		IssuedAt:      now,
+		ExpiresAt:     expires,
+	}
+	assertion.Signature = ed25519.Sign(priv, assertion.payload())
+
+	return &ShowPackage{Envelope: env, Tokens: tokens, Assertion: assertion}, nil
+}
+
+// snapshot 返回签发记录的深拷贝（避免调用方持有锁内引用）。
+func (r *IssuanceRecord) snapshot() IssuanceRecord {
+	cp := *r
+	cp.CredID = append([]byte(nil), r.CredID...)
+	cp.HolderVerifyKey = append([]byte(nil), r.HolderVerifyKey...)
+	cp.Commitments = make(map[string][]byte, len(r.Commitments))
+	for k, v := range r.Commitments {
+		cp.Commitments[k] = append([]byte(nil), v...)
+	}
+	cp.Predicates = append([]string(nil), r.Predicates...)
+	return cp
 }
