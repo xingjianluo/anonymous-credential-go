@@ -128,6 +128,92 @@ func (h *Holder) BuildPresentation(req PresentRequest) (*Presentation, error) {
 		allowPreds[p] = true
 	}
 
+	// 旧格式凭证：沿用 legacy 出示路径（仅兼容窗口内可验证）。
+	if st.Cred.Legacy {
+		return h.buildLegacyPresentation(st, req, allowAttrs, allowPreds)
+	}
+	return h.buildV2Showing(st, req, allowAttrs, allowPreds)
+}
+
+// buildV2Showing 构造“多次出示不可关联”的 v2 证明。
+//
+// 每次出示重新生成：ShowID、RouteTag、一次性 Ed25519 出示密钥对。
+// 信封中不出现 CredID、化名、凭证级持有公钥、属性承诺集合、静态盐。
+func (h *Holder) buildV2Showing(st *StoredCredential, req PresentRequest,
+	allowAttrs, allowPreds map[string]bool) (*Presentation, error) {
+
+	showID, err := h.rng.RandomBytes(32)
+	if err != nil {
+		return nil, err
+	}
+	showPub, showPriv, err := ed25519.GenerateKey(asReader(h.rng))
+	if err != nil {
+		return nil, err
+	}
+
+	sc := st.Cred.Signed
+	now := h.clock.Now()
+	env := &ShowingEnvelope{
+		FormatVersion: ShowingFormatV2,
+		PolicyName:    sc.PolicyName,
+		PolicyVersion: sc.PolicyVersion,
+		ShowID:        showID,
+		HolderShowKey: showPub,
+		SessionNonce:  append([]byte(nil), req.SessionNonce...),
+		NotBefore:     now,
+		ExpiresAt:     sc.ExpiresAt,
+		GeneratedAt:   now,
+	}
+	env.RouteTag = routeTag(st.Cred.RoutingSecret, env.ShowID, env.SessionNonce,
+		sc.PolicyName, sc.PolicyVersion)
+
+	attrNames := make([]string, 0, len(allowAttrs))
+	for a := range allowAttrs {
+		attrNames = append(attrNames, a)
+	}
+	sort.Strings(attrNames)
+	for _, name := range attrNames {
+		v, vok := st.Cred.AttrValues[name]
+		salt, sok := st.Cred.Salts[name]
+		if !vok || !sok {
+			return nil, FailDetail(CodeDisclosureNotAllowed,
+				"requested disclosure attribute is not present in credential", name)
+		}
+		env.Disclosed = append(env.Disclosed, ShownAttribute{
+			Name:   name,
+			Value:  v,
+			ValTag: valTag(salt, env.ShowID, env.SessionNonce, name, v),
+		})
+	}
+
+	predNames := make([]string, 0, len(allowPreds))
+	for p := range allowPreds {
+		predNames = append(predNames, p)
+	}
+	sort.Strings(predNames)
+	for _, name := range predNames {
+		if _, ok := st.Cred.Signed.PredTokens[name]; !ok {
+			return nil, FailDetail(CodePredicateNotAllowed,
+				"requested predicate token is not available in credential", name)
+		}
+		env.Predicates = append(env.Predicates, name)
+	}
+
+	// 凭证级持有密钥授权“本次一次性出示公钥+披露范围”。
+	env.HolderAuth = ed25519.Sign(st.HolderSignK, env.holderAuthPayload())
+	// 一次性出示密钥对信封签名：背书只能与本信封一起使用。
+	env.HolderProof = ed25519.Sign(showPriv, showProofPayload(env))
+
+	return &Presentation{
+		Showing:      env,
+		SessionNonce: append([]byte(nil), req.SessionNonce...),
+		GeneratedAt:  now,
+	}, nil
+}
+
+// buildLegacyPresentation 保留旧格式的选择性披露证明构造。
+func (h *Holder) buildLegacyPresentation(st *StoredCredential, req PresentRequest,
+	allowAttrs, allowPreds map[string]bool) (*Presentation, error) {
 	// 仅披露存在于凭证中且被明确授权的属性。
 	disclosed := []PresentedAttribute{}
 	attrNames := make([]string, 0, len(allowAttrs))

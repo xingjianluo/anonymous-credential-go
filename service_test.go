@@ -32,7 +32,16 @@ func newFixture(t *testing.T, seed uint64) *fixture {
 	svc.Issuer.WithAudit(svc.Audit)
 	svc.Verifier.WithAudit(svc.Audit)
 
+	// 现有夹具沿用旧格式语义：显式签发 legacy 凭证并开放无限兼容窗口，
+	// 从而既有签发/披露/重放/篡改/撤销用例保持原行为；
+	// v2 不可关联行为由 unlinkable_test.go 等新增用例覆盖。
 	mustReg(t, svc, v1Policy(start))
+	if err := svc.Issuer.UseLegacy(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetLegacyWindow(1, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
 	return &fixture{svc: svc, clock: clock, logs: &logs, start: start}
 }
 
@@ -40,6 +49,11 @@ func mustReg(t *testing.T, svc *Service, p Policy) {
 	t.Helper()
 	if err := svc.RegisterPolicy(p); err != nil {
 		t.Fatalf("register policy: %v", err)
+	}
+	// 既有测试沿用旧格式语义：默认开放无限兼容窗口；
+	// 兼容窗口的收紧/结束由 version_test.go 的专门用例断言。
+	if err := svc.SetLegacyWindow(p.Version, time.Time{}); err != nil {
+		t.Fatalf("set legacy window: %v", err)
 	}
 }
 

@@ -24,6 +24,9 @@ func NewAuditLogger(w io.Writer) *AuditLogger {
 }
 
 // LogDecision 记录一次验证结论。
+//
+// v2 出示只记录每次独立随机的 show_id；cred_id 字段在 v2 下保持空串，
+// 审计日志本身不得成为跨出示关联渠道。
 func (a *AuditLogger) LogDecision(d *Decision) {
 	if a == nil || d == nil {
 		return
@@ -36,9 +39,10 @@ func (a *AuditLogger) LogDecision(d *Decision) {
 			slog.String("issuer", d.Issuer),
 			slog.Int("policy_version", d.PolicyVersion),
 			slog.String("cred_id", d.CredID),
+			slog.String("show_id", d.ShowID),
 			slog.Any("disclosed_attrs", d.DisclosedAttrs),
 			slog.Any("predicates", d.Predicates),
-			slog.String("basis", "signature_ok|commitments_ok|session_bound|not_revoked"),
+			slog.String("basis", "attestation_ok|session_bound|not_revoked"),
 			slog.Time("checked_at", d.CheckedAt),
 		)
 		return
@@ -50,6 +54,7 @@ func (a *AuditLogger) LogDecision(d *Decision) {
 		slog.String("issuer", d.Issuer),
 		slog.Int("policy_version", d.PolicyVersion),
 		slog.String("cred_id", d.CredID),
+		slog.String("show_id", d.ShowID),
 		slog.Any("disclosed_attrs", d.DisclosedAttrs),
 		slog.Any("predicates", d.Predicates),
 		slog.String("basis", string(d.Reason)),

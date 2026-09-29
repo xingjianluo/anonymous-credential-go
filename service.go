@@ -46,6 +46,7 @@ func NewService(cfg ServiceConfig) *Service {
 	trust := NewTrustRegistry()
 	ver := NewVerifier(cfg.Clock, cfg.VerifierRNG, trust).
 		WithRevocationSource(iss).
+		WithShowingAuthority(iss).
 		WithAudit(audit)
 	return &Service{
 		Issuer:   iss,
@@ -58,13 +59,29 @@ func NewService(cfg ServiceConfig) *Service {
 }
 
 // RegisterPolicy 向签发方与验证方信任库同时登记策略版本。
+//
+// 同一版本号重复登记：参数一致幂等；任一侧参数不一致返回 version_conflict，
+// 绝不会被悄悄覆盖。
 func (s *Service) RegisterPolicy(p Policy) error {
 	pub, err := s.Issuer.AddPolicyVersion(p)
 	if err != nil {
 		return err
 	}
-	s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub})
-	return nil
+	return s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub})
+}
+
+// RegisterLegacyPolicy 登记策略版本并声明旧格式凭证的兼容窗口；
+// end 为零值表示窗口无限（迁移/测试用途）。
+func (s *Service) RegisterLegacyPolicy(p Policy, end time.Time) error {
+	if err := s.RegisterPolicy(p); err != nil {
+		return err
+	}
+	return s.Trust.SetLegacyWindow(s.Issuer.name, p.Version, end)
+}
+
+// SetLegacyWindow 为已登记版本更新旧格式兼容窗口。
+func (s *Service) SetLegacyWindow(version int, end time.Time) error {
+	return s.Trust.SetLegacyWindow(s.Issuer.name, version, end)
 }
 
 // IssueAndHold 执行“申请-签发-入钱包”的完整签发流程，返回凭证 ID（hex）。
@@ -74,6 +91,7 @@ func (s *Service) IssueAndHold(req IssueRequest) (string, error) {
 		PolicyVersion: req.PolicyVersion,
 		TTL:           req.TTL,
 		Attributes:    req.Attributes,
+		Legacy:        req.Legacy,
 	})
 	if err != nil {
 		return "", err

@@ -25,6 +25,27 @@ type TrustProfile struct {
 	Public     IssuerPublic
 	// Rejected=true 表示该历史版本按明确规则被拒绝（版本日落）。
 	Rejected bool
+	// LegacyAllowed 声明旧格式（CredID 上链）凭证是否仍在兼容窗口内。
+	// 默认 false 表示不接受旧格式；由 RegisterPolicyWithLegacyWindow 显式开启。
+	LegacyAllowed bool
+	// LegacyWindowEnd 为旧格式兼容窗口的截止时刻（含）；零值表示窗口无限。
+	LegacyWindowEnd time.Time
+}
+
+// LegacyPermittedAt 报告在时刻 t 旧格式凭证是否仍可按兼容窗口接受。
+func (tp *TrustProfile) LegacyPermittedAt(t time.Time) bool {
+	if tp == nil || tp.Rejected || !tp.LegacyAllowed {
+		return false
+	}
+	if tp.LegacyWindowEnd.IsZero() {
+		return true
+	}
+	return !t.After(tp.LegacyWindowEnd)
+}
+
+// LegacyWindow 声明旧格式兼容窗口；zeroEnd=true 表示窗口无限（仅用于测试/迁移初期）。
+type LegacyWindow struct {
+	End time.Time
 }
 
 // TrustRegistry 登记受信签发方版本；未知版本一律拒绝。
@@ -43,11 +64,37 @@ func trustKey(issuer string, version int) string {
 }
 
 // Register 登记一个受信版本。
-func (r *TrustRegistry) Register(tp TrustProfile) {
+//
+// 同一版本号重复登记时：参数（签发方公钥或模式指纹）不一致一律返回
+// CodeVersionConflict，绝不被后一次悄悄覆盖；完全一致则幂等成功。
+func (r *TrustRegistry) Register(tp TrustProfile) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	k := trustKey(tp.IssuerName, tp.Public.Policy.Version)
+	if existing, ok := r.profiles[k]; ok {
+		if !bytes.Equal(existing.Public.VerifyingKey, tp.Public.VerifyingKey) ||
+			!bytes.Equal(existing.Public.SchemaHash, tp.Public.SchemaHash) {
+			return FailDetail(CodeVersionConflict,
+				"trusted version was already registered with different parameters", k)
+		}
+		return nil
+	}
 	cp := tp
-	r.profiles[trustKey(tp.IssuerName, tp.Public.Policy.Version)] = &cp
+	r.profiles[k] = &cp
+	return nil
+}
+
+// SetLegacyWindow 为已登记版本声明旧格式兼容窗口；未知版本返回 CodeUnknownVersion。
+func (r *TrustRegistry) SetLegacyWindow(issuer string, version int, end time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tp, ok := r.profiles[trustKey(issuer, version)]
+	if !ok {
+		return FailDetail(CodeUnknownVersion, "trust registry has no such version", trustKey(issuer, version))
+	}
+	tp.LegacyAllowed = true
+	tp.LegacyWindowEnd = end.UTC()
+	return nil
 }
 
 // RejectVersion 将一个已登记版本标记为显式拒绝（历史版本日落规则）。
@@ -100,6 +147,7 @@ type Verifier struct {
 	clock    Clock
 	trust    *TrustRegistry
 	revoke   RevocationSource
+	showing  ShowingAuthority
 	audit    *AuditLogger
 	sessions map[string]*Session
 }
@@ -126,6 +174,12 @@ func NewVerifier(clock Clock, rng RNG, trust *TrustRegistry) *Verifier {
 // WithRevocationSource 注入撤销状态来源（通常为签发方）。
 func (v *Verifier) WithRevocationSource(rs RevocationSource) *Verifier {
 	v.revoke = rs
+	return v
+}
+
+// WithShowingAuthority 注入 v2 不可关联出示的签发方背书来源。
+func (v *Verifier) WithShowingAuthority(sa ShowingAuthority) *Verifier {
+	v.showing = sa
 	return v
 }
 
@@ -194,7 +248,8 @@ type Decision struct {
 	SessionID      string
 	Issuer         string
 	PolicyVersion  int
-	CredID         string
+	CredID         string // 仅旧格式携带；v2 刻意为空，避免跨出示追踪
+	ShowID         string // v2 每次出示独立随机；仅本次有效，不具跨出示关联性
 	DisclosedAttrs []string
 	Predicates     []string
 	CheckedAt      time.Time
@@ -231,6 +286,11 @@ func (v *Verifier) Verify(sessionID string, pres *Presentation) (dec *Decision, 
 	}
 	if pres == nil {
 		return nil, Fail(CodeMalformedPresentation, "nil presentation")
+	}
+
+	// v2 不可关联出示走独立验证路径。
+	if pres.isV2() {
+		return v.verifyV2(sess, pres, now)
 	}
 
 	// 校验窗口起点的撤销纪元。
@@ -283,6 +343,13 @@ func (v *Verifier) Verify(sessionID string, pres *Presentation) (dec *Decision, 
 	if !bytes.Equal(sc.SchemaHash, tp.Public.SchemaHash) {
 		return fail(CodeIncompatibleParameters,
 			"credential schema hash does not match the trusted parameters for this version", "")
+	}
+
+	// 旧格式仅在声明的兼容窗口内可验证：窗口结束 -> 明确拒绝（绝不静默放行）。
+	if !tp.LegacyPermittedAt(now) {
+		return fail(CodeCompatWindowClosed,
+			"legacy presentation is outside the declared compatibility window",
+			trustKey(sess.Issuer, sc.PolicyVersion))
 	}
 
 	// 2) 凭证结构完整性：不得携带隐藏的谓词令牌集合（防未披露信息泄露）。

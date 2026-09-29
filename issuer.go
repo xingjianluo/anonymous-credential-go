@@ -3,6 +3,7 @@ package anoncred
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -30,6 +31,9 @@ type Issuer struct {
 	signKeys map[int]ed25519.PrivateKey
 	// activeVersion 为当前签发使用的版本
 	activeVersion int
+
+	// legacyDefault 为 true 时，未显式指定格式的签发按旧格式生成（测试/迁移用）。
+	legacyDefault bool
 
 	// records: credID hex -> 签发记录
 	records map[string]*IssuanceRecord
@@ -65,8 +69,26 @@ func (is *Issuer) WithAudit(a *AuditLogger) *Issuer {
 
 // AddPolicyVersion 登记一个策略版本并为其生成独立签名密钥。
 //
+// 重复发布规则（同版本号不得被后一次悄悄覆盖）：
+//   - 同一版本号再次登记且策略参数完全一致：幂等，保留首次发布的密钥与公开材料；
+//   - 同一版本号但参数/模式不同：返回 CodeVersionConflict，绝不覆盖既有发布。
+//
 // 首次登记策略时，签发方对外名称采用策略名（凭证中 PolicyName 与信任标识一致）。
 func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
+	is.mu.Lock()
+	if existing, ok := is.versions[p.Version]; ok {
+		if !reflect.DeepEqual(existing.Policy, p) {
+			is.mu.Unlock()
+			return nil, FailDetail(CodeVersionConflict,
+				"policy version was already published with different parameters",
+				is.name+"#"+itoa(p.Version))
+		}
+		cp := *existing
+		is.mu.Unlock()
+		return &cp, nil
+	}
+	is.mu.Unlock()
+
 	pub, priv, err := ed25519.GenerateKey(asReader(is.rng))
 	if err != nil {
 		return nil, err
@@ -104,6 +126,14 @@ func (is *Issuer) UseVersion(v int) error {
 	return nil
 }
 
+// UseLegacy 设置后续签发是否默认采用旧格式（仅迁移期/测试使用）。
+func (is *Issuer) UseLegacy(on bool) error {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	is.legacyDefault = on
+	return nil
+}
+
 // ActivePublic 返回当前签发版本的公开材料。
 func (is *Issuer) ActivePublic() *IssuerPublic {
 	is.mu.RLock()
@@ -134,6 +164,9 @@ type IssueRequest struct {
 	HolderVerifyKey ed25519.PublicKey
 	// HolderSignKey 在 PrepareIssue 时由持有者生成并暂存，签发成功后入钱包。
 	HolderSignKey ed25519.PrivateKey
+	// Legacy=true 时按旧格式（CredID 上链）签发；默认签发 v2 不可关联凭证。
+	// 旧格式凭证仅在验证方声明的兼容窗口内可验证。
+	Legacy bool
 }
 
 // Issue 按当前策略版本校验申请并签发凭证；校验失败按错误类型码拒绝。
@@ -141,6 +174,7 @@ func (is *Issuer) Issue(req IssueRequest) (*Credential, error) {
 	is.mu.RLock()
 	pub := is.versions[is.activeVersion]
 	priv := is.signKeys[is.activeVersion]
+	legacy := req.Legacy || is.legacyDefault
 	is.mu.RUnlock()
 	if pub == nil {
 		return nil, Fail(CodePolicyMismatch, "issuer has no active policy version")
@@ -168,6 +202,15 @@ func (is *Issuer) Issue(req IssueRequest) (*Credential, error) {
 	credID, err := is.rng.RandomBytes(16)
 	if err != nil {
 		return nil, err
+	}
+	// 路由秘密同样每凭证独立随机：仅用于派生 v2 出示时的一次性路由标签；
+	// 旧格式凭证不需要（也不应携带）该秘密。
+	var routingSecret []byte
+	if !legacy {
+		routingSecret, err = is.rng.RandomBytes(32)
+		if err != nil {
+			return nil, err
+		}
 	}
 	now := is.clock.Now()
 	ttl := req.TTL
@@ -223,20 +266,26 @@ func (is *Issuer) Issue(req IssueRequest) (*Credential, error) {
 	signed.Signature = ed25519.Sign(priv, signed.signPayload())
 
 	cred := &Credential{
-		Signed:     signed,
-		Salts:      salts,
-		AttrValues: req.Attributes,
+		Signed:        signed,
+		Salts:         salts,
+		AttrValues:    req.Attributes,
+		RoutingSecret: append([]byte(nil), routingSecret...),
+		Legacy:        legacy,
 	}
 
 	// 留存记录：仅含承诺，不含属性明文；同一持有者的不同凭证 CredID 独立随机。
 	rec := &IssuanceRecord{
-		CredID:        append([]byte(nil), credID...),
-		Pseudonym:     req.Pseudonym,
-		PolicyName:    pol.Name,
-		PolicyVersion: pol.Version,
-		Commitments:   commits, // 与凭证共享同一 map 引用；见落库前复制
-		IssuedAt:      now,
-		ExpiresAt:     signed.ExpiresAt,
+		CredID:          append([]byte(nil), credID...),
+		Pseudonym:       req.Pseudonym,
+		PolicyName:      pol.Name,
+		PolicyVersion:   pol.Version,
+		Salts:           saltsCopy(salts),
+		RoutingSecret:   append([]byte(nil), routingSecret...),
+		PredTokens:      tokens,
+		HolderVerifyKey: append([]byte(nil), req.HolderVerifyKey...),
+		IssuedAt:        now,
+		ExpiresAt:       signed.ExpiresAt,
+		Legacy:          legacy,
 	}
 	recCommit := make(map[string][]byte, len(commits))
 	for k, v := range commits {
@@ -293,11 +342,30 @@ func (is *Issuer) LookupRecord(credID []byte) *IssuanceRecord {
 	}
 	cp := *rec
 	cp.CredID = append([]byte(nil), rec.CredID...)
+	cp.RoutingSecret = append([]byte(nil), rec.RoutingSecret...)
+	cp.HolderVerifyKey = append([]byte(nil), rec.HolderVerifyKey...)
 	cp.Commitments = make(map[string][]byte, len(rec.Commitments))
 	for k, v := range rec.Commitments {
 		cp.Commitments[k] = append([]byte(nil), v...)
 	}
+	cp.Salts = make(map[string][]byte, len(rec.Salts))
+	for k, v := range rec.Salts {
+		cp.Salts[k] = append([]byte(nil), v...)
+	}
+	cp.PredTokens = copyPredTokens(rec.PredTokens)
 	return &cp
+}
+
+func copyPredTokens(in map[string]PredicateToken) map[string]PredicateToken {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]PredicateToken, len(in))
+	for k, t := range in {
+		t.Signature = append([]byte(nil), t.Signature...)
+		out[k] = t
+	}
+	return out
 }
 
 // Records 返回全部签发记录的快照（供核对/审计）。
@@ -308,10 +376,17 @@ func (is *Issuer) Records() []IssuanceRecord {
 	for _, rec := range is.records {
 		cp := *rec
 		cp.CredID = append([]byte(nil), rec.CredID...)
+		cp.RoutingSecret = append([]byte(nil), rec.RoutingSecret...)
+		cp.HolderVerifyKey = append([]byte(nil), rec.HolderVerifyKey...)
 		cp.Commitments = make(map[string][]byte, len(rec.Commitments))
 		for k, v := range rec.Commitments {
 			cp.Commitments[k] = append([]byte(nil), v...)
 		}
+		cp.Salts = make(map[string][]byte, len(rec.Salts))
+		for k, v := range rec.Salts {
+			cp.Salts[k] = append([]byte(nil), v...)
+		}
+		cp.PredTokens = copyPredTokens(rec.PredTokens)
 		out = append(out, cp)
 	}
 	return out
@@ -321,6 +396,15 @@ func (is *Issuer) logIssuance(credIDHex string, rejected Code, detail string) {
 	if is.audit != nil {
 		is.audit.LogIssuance(is.name, is.activeVersion, credIDHex, rejected, detail)
 	}
+}
+
+// saltsCopy 深拷贝每属性盐表。
+func saltsCopy(in map[string][]byte) map[string][]byte {
+	out := make(map[string][]byte, len(in))
+	for k, v := range in {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
 }
 
 func itoa(v int) string {

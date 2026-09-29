@@ -19,23 +19,34 @@ type PresentedPredicate struct {
 
 // Presentation 是持有者对外出示的证明。
 //
+// 两种格式：
+//   - 旧格式（兼容窗口）：Showing==nil，使用 Signed/Disclosed/Predicates，CredID 上链；
+//   - v2 不可关联格式：Showing!=nil，长期标识（CredID/承诺集/凭证级公钥/化名）一律不出现，
+//     Attestation 由签发方在验证阶段注入（持有者不直接持有）。
+//
 // 未被会话允许的属性值/谓词不得出现在任何字段中。
 type Presentation struct {
-	// 凭证公开部分（含签发方签名与承诺集合）
+	// 凭证公开部分（含签发方签名与承诺集合）——仅旧格式使用；v2 留空。
 	Signed SignedCredential `json:"signed"`
 
-	// 仅包含被允许披露的属性
+	// 仅包含被允许披露的属性——仅旧格式使用。
 	Disclosed []PresentedAttribute `json:"disclosed"`
-	// 仅包含被允许出示的谓词
+	// 仅包含被允许出示的谓词——仅旧格式使用。
 	Predicates []PresentedPredicate `json:"predicates"`
 
-	// 会话绑定：由持有者对 (会话随机数, 披露集合, 谓词集合, 凭证公开部分) 签名
+	// Showing 为 v2 不可关联出示信封；非 nil 时走 v2 验证路径。
+	Showing *ShowingEnvelope `json:"showing,omitempty"`
+
+	// 会话绑定：由持有者对 (会话随机数, 披露集合, 谓词集合, 凭证公开部分) 签名——旧格式。
 	SessionNonce []byte `json:"session_nonce"`
 	HolderProof  []byte `json:"holder_proof"`
 
 	// 证明生成时间（持有者时钟，用于日志/调试；信任以签名与会话为准）
 	GeneratedAt time.Time `json:"generated_at"`
 }
+
+// isV2 报告该证明是否为 v2 不可关联格式。
+func (p *Presentation) isV2() bool { return p != nil && p.Showing != nil }
 
 // holderProofPayload 返回持有者证明签名的规范摘要输入。
 //

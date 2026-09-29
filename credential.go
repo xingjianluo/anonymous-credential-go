@@ -25,9 +25,14 @@ func IntValue(i int64) Value { return Value{Int: i, IsInt: true} }
 //
 // 其中 Salts、AttrValues 属于持有者私密材料；对外出示时仅按需携带。
 type Credential struct {
-	Signed     SignedCredential  // 签发方签名的公开部分
+	Signed     SignedCredential  // 签发方签名的公开部分（v2 出示时不直接上链）
 	Salts      map[string][]byte // 每个属性的承诺盐
 	AttrValues map[string]Value  // 持有者保存的属性明文（不会出现在对外证明中）
+	// RoutingSecret 为每凭证独立随机的“路由秘密”：v2 出示时与本次随机数
+	// 散列出一次性路由标签，供签发方定位记录，本身绝不出现在对外证明中。
+	RoutingSecret []byte
+	// Legacy=true 表示按旧格式（CredID 直接上链）签发；仅在声明兼容窗口内可验证。
+	Legacy bool
 }
 
 // SignedCredential 是凭证中被签发方签名、可向验证方出示的公开部分。
@@ -69,11 +74,21 @@ type IssuanceRecord struct {
 	PolicyName    string
 	PolicyVersion int
 	Commitments   map[string][]byte // 仅保留承诺（盐为一次性随机，不可逆）
-	IssuedAt      time.Time
-	ExpiresAt     time.Time
-	Revoked       bool
-	RevokedAt     time.Time
-	RevokeReason  string
+	// Salts 与 RoutingSecret 仅用于 v2 出示背书时的“本次一次性核对”：
+	// 签发方据此重算一次性标签，它们本身不会出现在任何对外证明中。
+	Salts         map[string][]byte
+	RoutingSecret []byte
+	// PredTokens 为签发时预签的谓词令牌副本：v2 背书时据此复查谓词，
+	// 令牌只含谓词参数与签名，不含属性明文。
+	PredTokens map[string]PredicateToken
+	// HolderVerifyKey 为签入凭证的持有者公钥；v2 背书时据此校验持有者授权。
+	HolderVerifyKey []byte
+	IssuedAt        time.Time
+	ExpiresAt       time.Time
+	Revoked         bool
+	RevokedAt       time.Time
+	RevokeReason    string
+	Legacy          bool
 }
 
 // encodeValue 返回属性值的规范编码。

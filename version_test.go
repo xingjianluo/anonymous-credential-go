@@ -133,19 +133,22 @@ func TestIncompatibleParameters(t *testing.T) {
 	f := newFixture(t, 703)
 	id := f.issue(t, goodAttrs())
 
-	// 用“版本号同为 1、但模式定义漂移”的档案覆盖信任登记。
+	// 用“版本号同为 1、但模式定义漂移”的档案覆盖信任登记（模拟带外加载不一致档案）；
+	// 常规 Register 在参数冲突时会返回 version_conflict，故这里直接操作信任库内部条目。
 	drift := v2Policy(f.start)
 	drift.Version = 1
 	// 保留原签发方公钥，使失败精确归因于参数不兼容而非签名伪造。
 	origPub := f.svc.Issuer.ActivePublic()
-	f.svc.Trust.Register(TrustProfile{
+	f.svc.Trust.mu.Lock()
+	f.svc.Trust.profiles[trustKey("driving-entitlement", 1)] = &TrustProfile{
 		IssuerName: "driving-entitlement",
 		Public: IssuerPublic{
 			Policy:       drift,
 			VerifyingKey: origPub.VerifyingKey,
 			SchemaHash:   drift.SchemaHash(),
 		},
-	})
+	}
+	f.svc.Trust.mu.Unlock()
 
 	res := f.proveRaw(t, id, VerifyPolicy{
 		AllowPredicates: []string{"is_adult"}, TTL: time.Minute,

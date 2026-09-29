@@ -36,6 +36,11 @@ const (
 	CodeUnknownVersion         Code = "unknown_version"         // 未知版本，拒绝
 	CodeVersionRejected        Code = "version_rejected"        // 历史版本被显式停用（日落规则）
 	CodeIncompatibleParameters Code = "incompatible_parameters" // 版本参数/模式哈希不兼容
+	CodeVersionConflict        Code = "version_conflict"        // 同版本号重复发布但参数不一致
+	CodeCompatWindowClosed     Code = "compat_window_closed"    // 旧格式凭证超过声明的兼容窗口
+
+	// 不可关联出示
+	CodeShowingRejected Code = "showing_rejected" // 出示背书被签发方拒绝（路由标签无匹配凭证）
 
 	// 签发方管理
 	CodeNoSuchCredential Code = "no_such_credential" // 吊销/核对时找不到签发记录

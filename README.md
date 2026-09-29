@@ -1,38 +1,43 @@
-# 匿名凭证：本地签发 / 选择性披露 / 撤销服务（Go）
+# 匿名凭证：本地签发 / 选择性披露 / 不可关联出示 / 撤销服务（Go）
 
 单进程内用本地密钥与内存状态模拟三方，演示一套**可运行**的匿名凭证系统：
 
-- **签发方（Issuer）**：按属性策略签发凭证、留存可核对但不含属性明文的记录、执行吊销；
-- **持有者（Holder）**：保存凭证并按会话授权做选择性披露，证明“满足条件”而不暴露其余属性；
-- **验证方（Verifier）**：维护受信版本库与一次性会话，校验签名、承诺、会话绑定、时效与撤销状态。
+- **签发方（Issuer）**：按属性策略签发凭证、留存可核对但不含属性明文的记录、执行吊销，
+  并为 v2 出示签发会话绑定的短期背书；
+- **持有者（Holder）**：保存凭证并按会话授权做选择性披露；v2 出示每次刷新全部公开特征，
+  证明“满足条件”而不暴露其余属性，也不留下可跨场景串联的线索；
+- **验证方（Verifier）**：维护受信版本库与一次性会话，旧格式直接校验签名/承诺，
+  v2 格式校验“签发方短期背书 + 一次性持有者证明”，并做时效与撤销纪元线性化检查。
 
 所有随机源与时钟均可注入，测试在确定性种子与手工时钟下稳定运行，无需等待真实时间。
 
 ## 快速开始
 
 ```bash
-go run ./cmd/demo        # 端到端演示：签发 -> 选择性披露 -> 重放拒绝 -> 撤销拒绝
+go run ./cmd/demo        # 不可关联出示 -> 撤销即时生效 -> 兼容窗口结束 -> 重复发布冲突
 go test ./...            # 单元测试
-go test -race ./...      # 竞态检测（并发“校验 vs 吊销”一致性）
+go test -race ./...      # 竞态检测（多验证方并发验证与撤销交错）
 go test -cover ./...     # 覆盖率
 ```
 
 演示输出形如：
 
 ```
-issued credential: cd9b3b...
-decision 1: accepted=true disclosed=[level] predicates=[is_adult]
-decision 2 (replay): code=proof_replay
-decision 3 (after revoke): code=revoked_credential
+issued two v2 credentials for the same holder
+verifier1: accepted=true cred_id="" show_id=7c0bdc...
+verifier1: accepted=true cred_id="" show_id=17f52f...
+two scenes share no reusable show identifier; verifier decisions carry no cred id
+after revoke cred1: code=revoked_credential (decision cred_id="")
+cred2 still accepted after cred1 revoked: true
+replay rejected: code=proof_replay
+legacy credential accepted within compatibility window
+legacy after window: code=compat_window_closed
+identical republish: idempotent
+conflicting republish: code=version_conflict
 ```
 
-审计日志（JSON，stderr）中仅打印**会话标识、披露名称集合与判定依据**，例如：
-
-```json
-{"event":"verify","accepted":true,"session_id":"68ca...","issuer":"driving-entitlement",
- "policy_version":1,"cred_id":"cd9b...","disclosed_attrs":["level"],
- "predicates":["is_adult"],"basis":"signature_ok|commitments_ok|session_bound|not_revoked"}
-```
+审计日志（JSON，stderr）中 v2 验证行的 `cred_id` 恒为空串，仅出现每次独立随机的
+`show_id`，避免审计通道本身成为跨出示追踪渠道。
 
 ## 信任模型
 
@@ -63,11 +68,72 @@ decision 3 (after revoke): code=revoked_credential
 
 ### 模拟实现的已知限制（非生产级匿名）
 
-- CredID 出现在出示证明中，验证方理论上可在**多次出示之间**关联同一凭证。
-  生产实现应改用不可链接撤销机制（如 Merkle 累加器 / BBS 签名 + 成员资格证明）。
 - 谓词为有限集合（`>=`、`<=`、`=`），由签发方对“满足”预签名令牌，
   并非通用零知识范围证明；属性名集合（不含值）对验证方可见。
+- v2 出示中**被披露属性的明文值**按会话授权对验证方可见——两个验证方若看到
+  完全相同的罕见披露值组合，理论上可据“内容本身”猜测关联；不可关联保证针对的是
+  密码学标识层面（CredID/密钥/承诺/标签/盐），不隐藏被授权披露的内容。
+- v2 的签发方在出示阶段是在线参与方（背书模型），且签发方天然知道“谁拿过哪张凭证”；
+  不可关联针对的是**验证侧与验证侧之间**的拼合，签发方仍可按凭证核对与撤销。
 - 全部状态在内存中，进程退出即消失；无网络协议、无持久化。
+
+## 不可关联出示（v2）
+
+默认签发的凭证采用 v2 格式。一次 v2 出示涉及两个结构：
+
+- `ShowingEnvelope`（持有者 → 验证方 → 签发方）：携带每次全新随机的
+  **ShowID、RouteTag、一次性 Ed25519 出示密钥**，以及按本次随机数派生的
+  披露值标签（ValTag）。信封中**不含** CredID、化名、凭证级持有公钥、
+  属性承诺集合、静态盐与路由秘密。
+- `ShowingAttestation`（签发方 → 验证方）：签发方在内部完成路由定位、撤销/有效期
+  核对、持有者授权校验、披露值标签与谓词令牌复查后签发的**会话绑定短期背书**。
+  背书同样不含任何长期标识。
+
+### 不可关联范围（有测试断言）
+
+1. **多张凭证跨场景**：同一持有者的多张凭证在不同验证方、不同时间出示，
+   ShowID/RouteTag/一次性出示密钥/持有者授权签名/证明/ValTag 两两不得相同；
+   即使两个验证方合并全部公开结果与日志，也无法拼回同一持有者
+   （`TestMultipleCredentialsAcrossScenesUnlinkable`）。
+2. **单凭证重复出示**：同一张凭证多次出示，上述特征每次全部刷新，不存在跨场景
+   可复用的公开线索（`TestSameCredentialRepeatedShowsNoReusableClue`）。
+3. **撤销核对不可追踪**：v2 验证决策与审计日志的 `cred_id` 恒为空，只出现一次性
+   `show_id`；路由标签由“每凭证路由秘密 + 本次 ShowID + 会话 nonce”散列，
+   验证方既不知道秘密也无法枚举（`TestV2RevocationCheckIsNotTrackable`）。
+4. **背书不可搬移**：背书逐字段绑定 ShowID/会话 nonce/一次性出示密钥/披露集合，
+   为 A 信封取得的背书无法用于 B 信封（`TestV2AttestationCannotBeMoved`）。
+
+### 路由标签如何工作
+
+```
+RouteTag = SHA-256("anoncred:route:v2" | routingSecret | showID | sessionNonce | issuer#version)
+ValTag   = SHA-256("anoncred:valtag:v2" | salt | showID | sessionNonce | attrName | encode(value))
+```
+
+`routingSecret` 为每凭证独立随机、仅签发方与持有者知道；静态盐不进入信封。
+签发方在背书时遍历自身记录重算标签定位凭证，验证方拿到的标签每次不同且无法离线枚举，
+因而不能把多次核对串成轨迹。
+
+### 验证链
+
+```
+结构完整性 → nonce 绑定 → 版本/信任 → 会话披露白名单 → 展示时效
+→ 一次性持有者证明（防信封伪造/背书搬移）
+→ 签发方背书（内部原子完成：路由定位/撤销/有效期/授权/披露/谓词）
+→ 背书签名与逐字段绑定 → 撤销纪元窗口线性化
+```
+
+## 旧格式与兼容窗口
+
+v1（旧格式）证明直接携带 CredID 与承诺集合，验证方可以在多次出示间关联同一凭证。
+规则：
+
+1. 旧格式凭证必须显式以 legacy 方式签发（`Issuer.UseLegacy(true)` 或
+   `IssueRequest{Legacy: true}`），且**仅在受信版本声明的兼容窗口内可验证**。
+2. 窗口通过 `Service.SetLegacyWindow(version, end)` 声明；零值 `end` 表示窗口无限。
+3. 窗口结束后，旧格式证明被明确拒绝为 `compat_window_closed`（绝不静默放行，
+   也不与签名失败等原因混淆）。v2 证明不受该窗口影响。
+4. 旧格式凭证无法走 v2 背书路径（无路由秘密，背书时直接排除）。
 
 ## 选择性披露规则
 
@@ -78,6 +144,8 @@ decision 3 (after revoke): code=revoked_credential
    哪些未披露谓词；每个谓词令牌由签发方独立签名并绑定 CredID。
 4. 验证时重算每个披露属性的承诺，与凭证内已签名承诺比对：
    **篡改值、篡改盐、替换为他人承诺都会失败**（`tampered_disclosure`）。
+   v2 格式中静态盐不出信封，等价检查由签发方在背书时用一次性 ValTag 重算完成，
+   失败结论同为 `tampered_disclosure`。
 5. 披露了白名单之外的属性 / 谓词，分别返回 `disclosure_not_allowed` /
    `predicate_not_allowed`；携带完整谓词令牌集合返回 `undisclosed_leak`。
 6. 持有者证明的签名摘要覆盖：会话随机数、CredID、凭证主签名、每个披露项与谓词令牌，
@@ -97,12 +165,19 @@ decision 3 (after revoke): code=revoked_credential
 
 - `Issuer.Revoke(credID, reason)` 在互斥锁内将记录标记为已吊销，记录原因与时间。
 - 维护一个单调递增的**撤销纪元（epoch）**：每发生一次新的吊销动作 `+1`。
-- 验证方在密码学校验窗口**前后**各读取一次纪元：
-  - 快照显示已吊销 → `revoked_credential`；
-  - 窗口内纪元被推进（说明与某次吊销并发交错）→ 保守拒绝 `revoked_credential`，
-    从而“校验-吊销”结论**可线性化**，不会出现吊销已发生却返回陈旧接受。
-- 吊销是单调、幂等的：重复吊销不会改变纪元；未知凭证吊销返回
-  `no_such_credential`。吊销无关凭证不影响其他凭证在新窗口内的正常校验。
+- **旧格式**：验证方在密码学校验窗口前后各读取一次纪元，快照显示已吊销或窗口内
+  纪元推进 → `revoked_credential`（后者为与吊销并发交错时的保守拒绝）。
+- **v2**：路由定位、撤销检查、有效期检查、纪元读取全部在签发方背书临界区内原子
+  完成——撤销开始后到达的新出示一定拿不到背书；验证方再比较背书纪元与窗口前后的
+  纪元，与任意吊销并发交错时同样保守拒绝。
+- 撤销即时性语义：**撤销前完成的验证可以接受，撤销开始后新的出示必须失败**；
+  撤销核对不向验证方暴露 CredID，核对过程不留可串联的长期标识。
+- 吊销是单调、幂等的：重复吊销不改变纪元；未知凭证吊销返回 `no_such_credential`。
+  吊销一张凭证不影响其他有效凭证（v2/旧格式均有专门测试）。
+- **并发与批量边界**：会话在锁内先消费后判定，同一证明不可能被接受两次；
+  与某次吊销并发的、针对其他凭证的验证可能因纪元推进被**保守拒绝**（安全侧倾斜，
+  重试验证即可）。批量上千张凭证连续验证时结论按种子可复现
+  （`TestBatchThousandCredentialsConsistent`）。
 
 ## 版本兼容策略
 
@@ -112,10 +187,16 @@ decision 3 (after revoke): code=revoked_credential
 1. **未知版本**：信任库中不存在 → 建立会话即被拒（`unknown_version`）。
 2. **历史版本默认兼容**：只要版本仍在信任库中登记，旧凭证继续可验证
    （新旧版本可并存，各自独立密钥）。
-3. **显式日落（拒绝）**：`TrustRegistry.RejectVersion(issuer, v)` 后，
-   该版本既不能开新会话，已开会话提交旧凭证也返回 `version_rejected`。
+3. **同版本重复发布不得被悄悄覆盖**：
+   - 参数完全一致的重复发布 → **幂等**，保留首次发布的密钥（既有凭证不失效）；
+   - 版本号相同但策略参数/模式指纹或签发方公钥不一致 →
+     `version_conflict`，签发方与信任库两侧都会拒绝，首次发布不受影响。
+4. **显式日落（拒绝）**：`TrustRegistry.RejectVersion(issuer, v)` 后，
+   该版本既不能开新会话，已开会话提交证明（含 v2 背书）也返回 `version_rejected`。
    历史凭证的命运由此是**显式规则**，不是隐式行为。
-4. **参数不兼容**：版本号相同但模式指纹与受信参数不一致，或凭证版本与会话版本
+5. **旧格式兼容窗口**：旧格式证明仅在 `SetLegacyWindow` 声明的窗口内可验；
+   窗口结束 → `compat_window_closed`。
+6. **参数不兼容**：版本号相同但模式指纹与受信参数不一致，或凭证/出示版本与会话版本
    不一致 → `incompatible_parameters`。谓词令牌参数（阈值等）与策略定义漂移同样拒绝。
 
 ## 可区分的错误类型
@@ -125,33 +206,37 @@ decision 3 (after revoke): code=revoked_credential
 | 阶段 | 类型码 |
 |---|---|
 | 签发 | `missing_attribute`、`unknown_attribute`、`invalid_attribute_value`、`attribute_out_of_range`、`policy_mismatch` |
-| 证明结构 | `malformed_presentation`、`bad_issuer_signature`、`bad_holder_proof`、`tampered_disclosure`、`disclosure_not_allowed`、`predicate_not_allowed`、`undisclosed_leak` |
+| 证明结构 | `malformed_presentation`、`bad_issuer_signature`、`bad_holder_proof`、`tampered_disclosure`、`disclosure_not_allowed`、`predicate_not_allowed`、`undisclosed_leak`、`showing_rejected` |
 | 生命周期 | `revoked_credential`、`expired_credential`、`session_unknown`、`session_expired`、`proof_replay` |
-| 版本 | `unknown_version`、`version_rejected`、`incompatible_parameters` |
+| 版本 | `unknown_version`、`version_rejected`、`incompatible_parameters`、`version_conflict`、`compat_window_closed` |
 | 管理 | `no_such_credential` |
 
 ## 代码结构
 
 ```
-errors.go        可区分错误类型码
-infra.go         可注入随机源（crypto/rand / 确定性）、时钟（系统 / Fake）
-policy.go        属性与谓词规格、申请校验、模式哈希、谓词求值
-credential.go    值类型、承诺、凭证/谓词令牌的规范签名载荷
-issuer.go        策略版本密钥、签发、签发记录、吊销与撤销纪元
-holder.go        钱包、一次性出示密钥、选择性披露证明构造
-presentation.go  对外证明结构与持有者证明摘要
-verifier.go      信任库、一次性会话、完整校验链
-logging.go       结构化审计日志（不含未披露值）
-service.go       三方装配与端到端流程
-cmd/demo         可运行演示
-*_test.go        伪造/篡改/重放/越权/撤销/版本/并发等测试
+errors.go              可区分错误类型码
+infra.go               可注入随机源（crypto/rand / 确定性）、时钟（系统 / Fake）
+policy.go              属性与谓词规格、申请校验、模式哈希、谓词求值
+credential.go          值类型、承诺、凭证/谓词令牌的规范签名载荷、签发记录
+issuer.go              策略版本密钥（重复发布规则）、签发、签发记录、吊销与撤销纪元
+showing.go             v2 不可关联出示：信封/背书类型、路由标签与值标签、规范编码
+showing_authority.go   签发方对 v2 出示的原子背书核对（撤销/授权/披露/谓词）
+holder.go              钱包、一次性出示密钥、legacy 与 v2 两种证明构造
+presentation.go        对外证明结构（双格式）与持有者证明摘要
+verifier.go            信任库（含兼容窗口）、一次性会话、旧格式校验链
+verifier_v2.go         v2 背书校验链与背书-信封绑定检查
+logging.go             结构化审计日志（v2 不记录 cred_id）
+service.go             三方装配与端到端流程
+cmd/demo               可运行演示
+*_test.go              伪造/篡改/重放/越权/撤销/版本/并发/批量/不可关联等测试
 ```
 
 ## 在代码中使用
 
 ```go
 svc := anoncred.NewService(anoncred.ServiceConfig{Clock: anoncred.NewFakeClock(now)})
-_ = svc.RegisterPolicy(policy)
+_ = svc.RegisterPolicy(policy)            // 默认签发的即为 v2 不可关联凭证
+// _ = svc.SetLegacyWindow(1, windowEnd)  // 仅迁移期需要接受旧格式时声明窗口
 
 credID, _ := svc.IssueAndHold(anoncred.IssueRequest{
     PolicyName: policy.Name, PolicyVersion: policy.Version,
@@ -162,6 +247,15 @@ res, _ := svc.Prove(credID, anoncred.VerifyPolicy{
     AllowAttrs: []string{"level"}, AllowPredicates: []string{"is_adult"},
 }, []string{"level"}, []string{"is_adult"})
 
-d, err := svc.Check(res.SessionID, res.Presentation) // 验证
-_ = svc.Revoke(credID, "reason")                      // 吊销
+d, err := svc.Check(res.SessionID, res.Presentation) // 验证（d.CredID 为空，d.ShowID 一次性）
+_ = svc.Revoke(credID, "reason")                      // 吊销：之后新出示立即失败
+```
+
+本地验证新增场景：
+
+```bash
+go test -run 'TestMultipleCredentialsAcrossScenesUnlinkable|TestSameCredentialRepeatedShowsNoReusableClue' .
+go test -run 'TestV2Revocation' .                  # 撤销即时生效/不可追踪/不误伤
+go test -run 'TestIssuerRepublish|TestTrustRegistryRepublish|TestLegacyCompatWindowEnd' .
+go test -run 'TestBatchThousand|TestV2ConcurrentMulti' . -race
 ```
