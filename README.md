@@ -187,10 +187,32 @@ v1（旧格式）证明直接携带 CredID 与承诺集合，验证方可以在�
 1. **未知版本**：信任库中不存在 → 建立会话即被拒（`unknown_version`）。
 2. **历史版本默认兼容**：只要版本仍在信任库中登记，旧凭证继续可验证
    （新旧版本可并存，各自独立密钥）。
-3. **同版本重复发布不得被悄悄覆盖**：
+3. **同版本重复发布不得被悄悄覆盖（串行与并发语义一致）**：
    - 参数完全一致的重复发布 → **幂等**，保留首次发布的密钥（既有凭证不失效）；
    - 版本号相同但策略参数/模式指纹或签发方公钥不一致 →
      `version_conflict`，签发方与信任库两侧都会拒绝，首次发布不受影响。
+   - **并发收紧**：`Issuer.AddPolicyVersion` 的“检查版本是否存在 → 生成签名
+     密钥 → 写入版本表”全程持同一把互斥锁原子完成，不再在锁外生成密钥；
+     `Service.RegisterPolicy` 另用一把服务级登记锁串行化“签发方发布 +
+     信任库登记”的跨组件过程。因此多条初始化执行流并发登记同一版本时，
+     可观察结果与按某种顺序串行登记**完全等价**：
+     - 相同参数：所有登记都成功，且都返回/共享**首次发布的同一份密钥与
+       公开材料**，任何一次登记都不会换掉它，发布前后已签发的凭证继续有效；
+     - 不同参数：恰好首个发布的一种参数生效，其余每次登记都返回可明确区分的
+       `version_conflict`（与 `bad_issuer_signature`、`incompatible_parameters`、
+       `unknown_version` 等失败不是同一类型码），失败方不改动签发方或信任库
+       的任何已发布状态；
+     - 发布与签发/验证交错时，签发实际使用的密钥与验证方信任的密钥始终是
+       同一份：发布结束后新签发的凭证必然可验证，已签发凭证继续有效（仅按
+       显式的版本日落/兼容窗口规则才会被拒绝）；
+     - **失败边界（无半更新）**：若某版本是本次首发、而随后的信任库登记失败，
+       该次首发会被回滚（删除该版本的公开材料与私钥），系统回到登记前状态，
+       不会留下“签发方有、信任库没有/不一致”的半成品；重复发布路径上的冲突
+       失败则完全不触碰既有版本。对应用例见
+       `TestConcurrentRepublishSameParametersIdempotent`、
+       `TestConcurrentRepublishConflictingParameters`、
+       `TestConcurrentPublishInterleavedWithIssueAndVerify`、
+       `TestFailedPublishLeavesNoHalfUpdatedState`。
 4. **显式日落（拒绝）**：`TrustRegistry.RejectVersion(issuer, v)` 后，
    该版本既不能开新会话，已开会话提交证明（含 v2 背书）也返回 `version_rejected`。
    历史凭证的命运由此是**显式规则**，不是隐式行为。
@@ -229,6 +251,8 @@ logging.go             结构化审计日志（v2 不记录 cred_id）
 service.go             三方装配与端到端流程
 cmd/demo               可运行演示
 *_test.go              伪造/篡改/重放/越权/撤销/版本/并发/批量/不可关联等测试
+                       （republish_concurrency_test.go：并发重复发布的幂等/
+                         冲突/交错一致性，确定性同步闸门复现，无需真实等待）
 ```
 
 ## 在代码中使用
@@ -254,8 +278,17 @@ _ = svc.Revoke(credID, "reason")                      // 吊销：之后新出�
 本地验证新增场景：
 
 ```bash
-go test -run 'TestMultipleCredentialsAcrossScenesUnlinkable|TestSameCredentialRepeatedShowsNoReusableClue' .
-go test -run 'TestV2Revocation' .                  # 撤销即时生效/不可追踪/不误伤
+# 并发重复发布（相同参数幂等 / 冲突参数只有一方成功 / 与签发验证交错 / 失败不留半更新）
+go test -run 'TestConcurrentRepublish|TestConcurrentPublishInterleaved|TestFailedPublishLeaves' -v .
+
+# 竞态检测下重复跑（用例用可注入随机源+时钟与同步闸门复现，不依赖真实等待）
+go test -race -count=10 -run 'TestConcurrentRepublish|TestConcurrentPublishInterleaved|TestFailedPublishLeaves' .
+
+# 原有的串行重复发布 / 信任库冲突 / 兼容窗口用例不回归
 go test -run 'TestIssuerRepublish|TestTrustRegistryRepublish|TestLegacyCompatWindowEnd' .
 go test -run 'TestBatchThousand|TestV2ConcurrentMulti' . -race
+
+# 全量单测（-v 日志可看到每个用例覆盖的业务与通过情况；新增用例还会输出
+# “业务=…”小结行）+ 竞态检测
+go test -race -v ./...
 ```

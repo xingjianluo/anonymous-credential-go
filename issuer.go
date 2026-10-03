@@ -73,22 +73,28 @@ func (is *Issuer) WithAudit(a *AuditLogger) *Issuer {
 //   - 同一版本号再次登记且策略参数完全一致：幂等，保留首次发布的密钥与公开材料；
 //   - 同一版本号但参数/模式不同：返回 CodeVersionConflict，绝不覆盖既有发布。
 //
+// 整个“检查—生成密钥—写入”过程在同一把互斥锁内原子完成，因此多个执行流
+// 并发登记同一版本号时，行为与串行登记完全一致：只有第一个执行流会生成
+// 密钥并发布，其余执行流要么拿到首次发布的同一份材料（参数一致），要么拿到
+// CodeVersionConflict（参数不一致）。密钥生成不会在锁外进行，杜绝“检查通过
+// 后、写入前被其他执行流抢先发布”的窗口。
+//
 // 首次登记策略时，签发方对外名称采用策略名（凭证中 PolicyName 与信任标识一致）。
 func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 	is.mu.Lock()
+	defer is.mu.Unlock()
 	if existing, ok := is.versions[p.Version]; ok {
 		if !reflect.DeepEqual(existing.Policy, p) {
-			is.mu.Unlock()
 			return nil, FailDetail(CodeVersionConflict,
 				"policy version was already published with different parameters",
 				is.name+"#"+itoa(p.Version))
 		}
 		cp := *existing
-		is.mu.Unlock()
 		return &cp, nil
 	}
-	is.mu.Unlock()
 
+	// 仍持锁：本版本确定由本次调用首次发布，生成密钥并一次性写入，
+	// 任何并发调用都只会在上方的已发布分支里结束。
 	pub, priv, err := ed25519.GenerateKey(asReader(is.rng))
 	if err != nil {
 		return nil, err
@@ -98,7 +104,6 @@ func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 		VerifyingKey: pub,
 		SchemaHash:   p.SchemaHash(),
 	}
-	is.mu.Lock()
 	if is.name == "" {
 		is.name = p.Name
 	}
@@ -107,8 +112,32 @@ func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 	if is.activeVersion == 0 {
 		is.activeVersion = p.Version
 	}
-	is.mu.Unlock()
 	return ip, nil
+}
+
+// removeFreshVersion 仅在“本次刚首次发布、但跨组件登记随后失败”的回滚路径上
+// 由同包的装配层调用：移除该版本的公开材料与签名密钥，使系统回到发布前状态，
+// 绝不留下半更新的版本。调用方必须确认该版本确为本次首发、且没有其他版本
+// 依赖它（回滚发生在跨组件登记仍在持锁进行时，签发尚不可见）。
+func (is *Issuer) removeFreshVersion(v int) {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	delete(is.versions, v)
+	delete(is.signKeys, v)
+	if is.activeVersion == v {
+		is.activeVersion = 0
+	}
+	if len(is.versions) == 0 {
+		is.name = ""
+	}
+}
+
+// hasVersion 报告某版本是否已在签发方发布（不改状态）。
+func (is *Issuer) hasVersion(v int) bool {
+	is.mu.RLock()
+	defer is.mu.RUnlock()
+	_, ok := is.versions[v]
+	return ok
 }
 
 // UseVersion 将当前签发版本切换为 v；未知版本返回 CodePolicyMismatch。

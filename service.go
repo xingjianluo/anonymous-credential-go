@@ -2,6 +2,7 @@ package anoncred
 
 import (
 	"encoding/hex"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,11 @@ type Service struct {
 	Trust    *TrustRegistry
 	Audit    *AuditLogger
 	Clock    Clock
+
+	// registerMu 串行化跨组件（签发方 + 信任库）的策略登记全过程。
+	// 多个初始化执行流并发登记同一版本时，登记步骤之间不会交错“签发/验证”：
+	// 每次成功的 RegisterPolicy 对外部都等价于一次不可分割的串行登记。
+	registerMu sync.Mutex
 }
 
 // ServiceConfig 为装配参数；nil 字段使用安全默认值。
@@ -62,12 +68,32 @@ func NewService(cfg ServiceConfig) *Service {
 //
 // 同一版本号重复登记：参数一致幂等；任一侧参数不一致返回 version_conflict，
 // 绝不会被悄悄覆盖。
+//
+// 并发语义：整个登记过程由服务级互斥锁串行化，且签发方内部的
+// “检查—生成密钥—写入”本身也是原子的。因此无论多少执行流并发登记同一版本，
+// 可观察结果都与按某种顺序串行登记完全一致：
+//   - 参数完全一致：全部成功，且共享首次发布的同一份签名密钥与公开材料；
+//   - 参数不一致：恰好首次发布的那一种参数生效，其余每次登记都得到可区分的
+//     version_conflict，失败方不改动签发方或信任库的任何已发布状态；
+//   - 不会出现“签发方与信任库各持一份不同密钥”的半更新状态：若某版本是本次
+//     首发、而信任库登记失败，则回滚签发方这次首发，系统回到登记前状态。
 func (s *Service) RegisterPolicy(p Policy) error {
+	s.registerMu.Lock()
+	defer s.registerMu.Unlock()
+
+	before := s.Issuer.hasVersion(p.Version)
 	pub, err := s.Issuer.AddPolicyVersion(p)
 	if err != nil {
 		return err
 	}
-	return s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub})
+	if err := s.Trust.Register(TrustProfile{IssuerName: s.Issuer.name, Public: *pub}); err != nil {
+		// 仅当该版本确为本次首发时才回滚；重复发布场景下既有版本必须保留。
+		if !before {
+			s.Issuer.removeFreshVersion(p.Version)
+		}
+		return err
+	}
+	return nil
 }
 
 // RegisterLegacyPolicy 登记策略版本并声明旧格式凭证的兼容窗口；
