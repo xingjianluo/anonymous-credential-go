@@ -1,9 +1,9 @@
 package anoncred
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -69,26 +69,36 @@ func (is *Issuer) WithAudit(a *AuditLogger) *Issuer {
 
 // AddPolicyVersion 登记一个策略版本并为其生成独立签名密钥。
 //
-// 重复发布规则（同版本号不得被后一次悄悄覆盖）：
-//   - 同一版本号再次登记且策略参数完全一致：幂等，保留首次发布的密钥与公开材料；
-//   - 同一版本号但参数/模式不同：返回 CodeVersionConflict，绝不覆盖既有发布。
+// 重复发布规则（同版本号不得被后一次悄悄覆盖，并发与串行语义一致）：
+//   - 同一版本号再次登记且策略参数（模式指纹）完全一致：幂等，保留首次发布的
+//     密钥与公开材料，本次登记不替换任何已生效状态；
+//   - 同一版本号但参数/模式不同：返回 CodeVersionConflict，绝不覆盖既有发布，
+//     失败方不改动任何已发布状态。
+//
+// 参数一致性按模式指纹（SchemaHash：策略名 + 属性/谓词规格）判定，
+// 与验证方信任库的“参数不兼容”口径一致；IssuedAt/Description 等元数据不参与判定。
+//
+// 并发安全：密钥生成在锁外进行，但“复查既有发布 + 安装新版本”在同一个写锁
+// 临界区内完成，因此多个执行流同时登记同一版本时只有首个安装生效，
+// 其余执行流要么幂等返回首次发布的材料，要么以冲突失败，绝不出现后发覆盖。
 //
 // 首次登记策略时，签发方对外名称采用策略名（凭证中 PolicyName 与信任标识一致）。
 func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
+	schema := p.SchemaHash()
+
+	// 快速路径：已发布版本在单个临界区内判定幂等/冲突。
 	is.mu.Lock()
 	if existing, ok := is.versions[p.Version]; ok {
-		if !reflect.DeepEqual(existing.Policy, p) {
-			is.mu.Unlock()
-			return nil, FailDetail(CodeVersionConflict,
-				"policy version was already published with different parameters",
-				is.name+"#"+itoa(p.Version))
+		defer is.mu.Unlock()
+		if !bytes.Equal(existing.SchemaHash, schema) {
+			return nil, is.versionConflict(p.Version)
 		}
-		cp := *existing
-		is.mu.Unlock()
-		return &cp, nil
+		return copyIssuerPublic(existing), nil
 	}
 	is.mu.Unlock()
 
+	// 未发布：先在锁外生成密钥（不阻塞其他版本的操作）；
+	// 生成失败时函数返回，未触碰任何状态，不会留下半更新的版本。
 	pub, priv, err := ed25519.GenerateKey(asReader(is.rng))
 	if err != nil {
 		return nil, err
@@ -96,9 +106,19 @@ func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 	ip := &IssuerPublic{
 		Policy:       p,
 		VerifyingKey: pub,
-		SchemaHash:   p.SchemaHash(),
+		SchemaHash:   schema,
 	}
+
+	// 安装与复查在同一临界区：并发登记同一版本时只有首个安装生效，
+	// 其余执行流丢弃自己生成的密钥，按既有发布判定幂等/冲突。
 	is.mu.Lock()
+	defer is.mu.Unlock()
+	if existing, ok := is.versions[p.Version]; ok {
+		if !bytes.Equal(existing.SchemaHash, schema) {
+			return nil, is.versionConflict(p.Version)
+		}
+		return copyIssuerPublic(existing), nil
+	}
 	if is.name == "" {
 		is.name = p.Name
 	}
@@ -107,8 +127,30 @@ func (is *Issuer) AddPolicyVersion(p Policy) (*IssuerPublic, error) {
 	if is.activeVersion == 0 {
 		is.activeVersion = p.Version
 	}
-	is.mu.Unlock()
-	return ip, nil
+	return copyIssuerPublic(ip), nil
+}
+
+// versionConflict 构造“同版本号参数冲突”错误（调用时需持有锁或无需读锁的上下文）。
+func (is *Issuer) versionConflict(version int) *Error {
+	return FailDetail(CodeVersionConflict,
+		"policy version was already published with different parameters",
+		is.name+"#"+itoa(version))
+}
+
+// copyIssuerPublic 深拷贝公开材料，避免调用方经返回指针改动已发布状态。
+func copyIssuerPublic(ip *IssuerPublic) *IssuerPublic {
+	if ip == nil {
+		return nil
+	}
+	cp := *ip
+	cp.VerifyingKey = append([]byte(nil), ip.VerifyingKey...)
+	cp.SchemaHash = append([]byte(nil), ip.SchemaHash...)
+	cp.Policy.Attributes = append([]AttributeSpec(nil), ip.Policy.Attributes...)
+	for i := range cp.Policy.Attributes {
+		cp.Policy.Attributes[i].Allowed = append([]string(nil), ip.Policy.Attributes[i].Allowed...)
+	}
+	cp.Policy.Predicates = append([]PredicateSpec(nil), ip.Policy.Predicates...)
+	return &cp
 }
 
 // UseVersion 将当前签发版本切换为 v；未知版本返回 CodePolicyMismatch。
@@ -134,14 +176,14 @@ func (is *Issuer) UseLegacy(on bool) error {
 	return nil
 }
 
-// ActivePublic 返回当前签发版本的公开材料。
+// ActivePublic 返回当前签发版本公开材料的拷贝（改动返回值不影响已发布状态）。
 func (is *Issuer) ActivePublic() *IssuerPublic {
 	is.mu.RLock()
 	defer is.mu.RUnlock()
-	return is.versions[is.activeVersion]
+	return copyIssuerPublic(is.versions[is.activeVersion])
 }
 
-// PublicOf 返回指定版本的公开材料。
+// PublicOf 返回指定版本公开材料的拷贝（改动返回值不影响已发布状态）。
 func (is *Issuer) PublicOf(version int) (*IssuerPublic, error) {
 	is.mu.RLock()
 	defer is.mu.RUnlock()
@@ -149,7 +191,7 @@ func (is *Issuer) PublicOf(version int) (*IssuerPublic, error) {
 	if !ok {
 		return nil, FailDetail(CodePolicyMismatch, "unknown policy version", is.name+"#"+itoa(version))
 	}
-	return ip, nil
+	return copyIssuerPublic(ip), nil
 }
 
 // IssueRequest 是一次凭证申领申请。
